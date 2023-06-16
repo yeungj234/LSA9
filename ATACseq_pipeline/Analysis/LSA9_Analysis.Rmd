@@ -1,0 +1,774 @@
+---
+title: "LSA9 Analysis"
+output: html_document
+---
+
+################################################################################
+# senescence motif analysis 
+# nicole pagane | 04/2021
+# this R script is intended to be run interactively and contains the following 
+# main sections:
+#   1. read in and prepare the data (correct for batch effects with ComBat_seq)
+#   2. variable accessibiltiy motif analysis on ATAC data with chromVAR  
+#   3. genomic annotations of peaks with chipseeker
+#   4. differential accessibility analysis on ATAC data with DESeq2 
+#   5. motif enrichment with motifmatchr and hypergeometric tests
+# it is expected that the user will significantly edit this file (i.e. change file
+# names, paths, uncomment lines, etc.). 
+```{r}
+BiocManager::install('preprocessCore')
+```
+```{r}
+library(preprocessCore)
+library(chromVAR)
+library(SummarizedExperiment)
+library(BiocParallel)
+library(JASPAR2016)
+register(SerialParam())
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(motifmatchr)
+library(GenomicRanges)
+library(pheatmap)
+library(DESeq2)
+library(sva)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(tidyverse)
+require(gridExtra)
+library(ggplot2) 
+library(RColorBrewer)
+library(viridis)
+library(clusterProfiler)
+library(enrichplot)
+organism = "org.Hs.eg.db"
+BiocManager::install(organism, character.only = TRUE)
+library(organism, character.only = TRUE)
+require(DOSE)
+install.packages("msigdbr")
+library(msigdbr)
+library(VennDiagram)
+library(motifmatchr)
+```
+
+################################################################################
+# 1. read in and prepare the data (correct for batch effects with ComBat_seq)
+################################################################################
+
+# set the working directory
+```{r}
+rawrundir <- "/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/"
+setwd(paste0(rawrundir))
+```
+###### ONLY COMPLETE THIS SECTION IF INTERMEDIATE FILES NOT ALREADY SAVED ######
+
+```{r}
+# set the sample names that we will work with
+libs <- c("Cyc-1", "Cyc-2", "d28-ctrl-1", "d28-ctrl-2", "d28-Miltenyi-1", "d28-Miltenyi-2","DDIS-ctrl-1", "DDIS-ctrl-2",  "DDIS-Miltenyi-2", "DDIS-Miltenyi-3", "ES-SAGA3-1", "ES-SAGA3-2", "SAGA-3-1", "SAGA-3-2")
+
+# read in the "master" peak file (extension: bed or narrowPeak). (ONLY NEED TO DO ONCE)
+
+peaks <- c()
+for(j in 1:length(libs)){
+peaks[j] <- dir(paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/pipe/", libs[j], "/peakCalls"), pattern = "*.narrowPeak", full.names = TRUE)
+
+myPeaks <- lapply(peaks, ChIPQC:::GetGRanges, simple = TRUE)
+allPeaksSet_nR <- reduce(unlist(GRangesList(myPeaks)))
+
+export.bed(allPeaksSet_nR, con="/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/MasterPeakSet.bed")
+
+# this "master" peak list should be the merged set of all the samples' narrowPeaks.
+bedfile = paste0(rawrundir,"Analysis/MasterPeakSet.bed")
+peaks <- getPeaks(bedfile, sort_peaks = TRUE)
+peaks <- resize(peaks, width=500, fix="center")
+
+# read in the BAM files for each sample. this is the final version of the BAM
+# file from the fastq2bam pipeline.
+# NOTE: since the functions "readNarrowpeaks" and "getCounts" are from chromVAR, 
+#       we use the original BAM/BED files WITHOUT the Tn5 bias correction. since
+#       chromVAR is made to be used with ATAC data, this correction is builtin. 
+
+bamFiles= c()
+for (i in 1:length(libs)) {
+  bamPath= dir(paste0(rawrundir, "pipe/", libs[i]), pattern=".bam", full.names=T)
+  bamFiles = c(bamFiles, bamPath)
+}
+
+# make matrix of fragment counts, where each peak in the "master" peak list makes
+# up the rows and each sample makes up the columns. Thus, the cells are the counts
+# of each peak in each sample's BAM file and stored as a RangedSummarizedExperiment
+fragmentCounts = getCounts(bamFiles, peaks, paired=TRUE, by_rg=FALSE, format="bam")
+```
+```{r}
+# we then compute the GC bias of the fragment counts to better determine background peaks 
+fragmentCounts = addGCBias(fragmentCounts, genome = BSgenome.Hsapiens.UCSC.hg19)
+
+# add the library names to the columns of the RangedSummarizedExperiment object
+colnames(fragmentCounts) <- libs
+# add the experiment batches to the RangedSummarizedExperiment object
+treatment <- c("None", "None", "None", "None", "Miltenyi", "Miltenyi","None", "None",  "Miltenyi", "Miltenyi", "EasySep", "EasySep", "None", "None")
+colData(fragmentCounts)$Treatment = treatment
+# add the senescent timepoints to the RangedSummarizedExperiment object
+timepoints <- c("Cycling", "Cycling", "day 28", "day 28", "day 28", "day 28","DDIS", "DDIS",  "DDIS", "DDIS", "day 21", "day 21", "day 21", "day 21")
+colData(fragmentCounts)$TimePoints = timepoints
+```
+
+```{r}
+# DO THIS ONCE TO THE MASTER PEAK LIST
+# filter the fragment counts to get rid of "master" peak rows with poor coverage across the samples.
+fragmentCounts <- filterSamples(fragmentCounts, min_depth=1500, min_in_peaks=0.15, shiny =FALSE)
+fragmentCounts <- sort(fragmentCounts)
+peaks <- sort(peaks)
+
+# look at average signal across row and look at cumulative distribution. Ranking peaks across total signal across samples and taking the top half. 
+counts_filtered <- filterPeaks(fragmentCounts, non_overlapping = TRUE, ix_return = TRUE)
+fragmentCounts <- fragmentCounts[counts_filtered,]
+peaks <- peaks[counts_filtered,]
+# save fixed width peaks
+write.table(peaks, file ="/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/LSA9_peaks_fixedWidth.bed", quote = FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+
+# save the raw counts 
+save(fragmentCounts, file = "/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/proximal_fragmentCounts.RData")
+write.table(as.matrix(rawCounts), file = "/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/proximal_rawCounts.txt", quote = FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+
+# get just the raw count matrix from the RangedSummarizedExperiment object 
+rawCounts = assays(fragmentCounts)[[1]]
+colnames(rawCounts) <- libs
+```
+
+
+###### READ IN INTERMEDIATE FILES IF THE ABOVE SECTION HAS ALREADY BEEN RUN ######
+# load("saved_intermediates/LSA2_fragmentCounts.RData") # or whatever count matrix you want
+
+######### ComBat_seq ######### 
+# this subsection is OPTIONAL.
+# here is where you would do ComBat_seq correction if your samples need to correct for batch effects
+```{r}
+combatRawCounts = sva::ComBat_seq(
+  # raw count matrix 
+    rawCounts, 
+  # batch info, i.e. different experiments
+    batch = treatment, 
+  # biological info, i.e. time points
+    group = timepoints,
+  # this is an optional argument to look at 
+    #covar_mod= covMat, 
+  # full_mod = TRUE if you want to incorporate group conditons
+    full_mod = TRUE)
+
+# reformat ComBat_seq output into a RangedSummarizedExperiment object 
+combatCounts <- SummarizedExperiment(SimpleList(counts=combatRawCounts), colData = colData(fragmentCounts), rowRanges= rowRanges(fragmentCounts))
+combatCounts <- SummarizedExperiment(SimpleList(counts=as.matrix(combatRawCounts)/fragmentCounts$depth), colData = colData(fragmentCounts), rowRanges= rowRanges(fragmentCounts))
+```
+
+# compare PCA plots of non-ComBat corrected raw counts to ComBat corrected.
+# we use the "DESeqTransform" function to extend the RangedSummarizedExperiment
+# into a class that the "plotPCA" function from DESeq2 can recognize.
+```{r}
+# look at the original PCA plot
+tempCounts <- SummarizedExperiment(SimpleList(counts=normalize.quantiles.robust(as.matrix(rawCounts))), colData = colData(fragmentCounts), rowRanges= rowRanges(fragmentCounts))
+p1 <- plotPCA(DESeqTransform(tempCounts), intgroup=c("Treatment", "TimePoints"), ntop=1000) + theme_classic() +
+  aes(color=timepoints, shape=treatment) + scale_color_manual(values=c("#000004FF", viridis(9)) )  + geom_point(size = 4) + 
+  theme(legend.position="bottom",legend.box = "vertical") + guides(col = guide_legend(ncol = 10)) +
+  theme(text = element_text(size=13))
+p2 <- plotPCA(DESeqTransform(fragmentCounts), intgroup="TimePoints", ntop=1000) + theme_classic()
+
+# look at combat corrected PCA plot
+tempCounts2 <- SummarizedExperiment(SimpleList(counts=normalize.quantiles.robust(as.matrix(combatRawCounts))), colData = colData(fragmentCounts), rowRanges= rowRanges(fragmentCounts))
+p3 <- plotPCA(DESeqTransform(tempCounts2), intgroup=c("Treatment", "TimePoints"), ntop=1000) + theme_classic() +
+    aes(color=timepoints, shape=treatment) + scale_color_manual(values=c("#000004FF", viridis(9)) )  + geom_point(size = 4) + 
+    theme(legend.position="bottom",legend.box = "vertical") + guides(col = guide_legend(ncol = 10)) +
+  theme(text = element_text(size=13))
+p4 <- plotPCA(DESeqTransform(combatCounts), intgroup="TimePoints", ntop=1000) + theme_classic()
+grid.arrange(p1, p2, p3, p4, ncol=2, nrow=2)
+
+write.table(normalize.quantiles.robust(as.matrix(combatRawCounts)), file = "/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/proximal_ComBat_quantileNormed.txt", quote = FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+```
+# resave fragmentCounts as corrected combatCounts
+#fragmentCounts <- combatCounts
+#rawCounts = assays(fragmentCounts)[[1]]
+
+# save the raw counts 
+#save(fragmentCounts, file = "saved_intermediates/proximal_ComBat_fragmentCounts.RData")
+#write.table(as.matrix(rawCounts), file = "saved_intermediates/LSA_ComBat_rawCounts.txt", quote = FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+
+################################################################################
+# 2. variable accessibiltiy site analysis on ATAC data with chromVAR
+################################################################################
+```{r}
+# load motifs from Jaspar
+motifs = getJasparMotifs()
+motif_ix = matchMotifs(motifs, fragmentCounts, genome=BSgenome.Hsapiens.UCSC.hg19)
+
+# find devation for each motif per sample
+deviations = computeDeviations(object = fragmentCounts, annotation = motif_ix)
+
+# get just the raw count matrix from the RangedSummarizedExperiment object 
+deviationsMat = assays(deviations)[[1]]
+
+# find variation in deviation for each motif between samples
+variability = computeVariability(deviations)
+
+# plot the variability of motifs
+plotVariability(variability, use_plotly = FALSE, n=20)
+# feel free to manually save this variability plot as a PDF!!
+
+#use only top n most variable motifs and make matrix of their deviations in each sample
+top_var_motif_names = row.names(head(variability[order(-variability$variability), ], n=70))
+sortedDeviations = deviations[top_var_motif_names,]
+sortedDeviationScores = assays(sortedDeviations)[[2]]
+
+# clean up row names for heatmap
+rownames(sortedDeviationScores) <- sapply(strsplit(rownames(sortedDeviationScores), "_"), "[", 2)
+# plot heatmap of each sample's deviation for each motif
+range <- 9 #22 #8 #max(abs(sortedDeviationScores));
+pheatmap(sortedDeviationScores, cluster_cols = FALSE, main = "Deviation Z-Score",
+         breaks = seq(-range, range, length.out = 100))
+# feel free to manually save this deviation heatmap as a PDF!!
+# save the sortedDeviationScores data if you want
+#write.table(sortedDeviationScores, file = "saved_intermediates/distal_ComBat_sortedDeviationScores.txt", quote = FALSE, row.names = TRUE, col.names = TRUE, sep = "\t")
+
+# plot heatmap of motifs' correlations with each other
+motif_cor <- getAnnotationCorrelation(fragmentCounts, motif_ix[, top_var_motif_names])
+rownames(motif_cor) <- sapply(strsplit(rownames(motif_cor), "_"), "[", 2)
+colnames(motif_cor) <- sapply(strsplit(colnames(motif_cor), "_"), "[", 2)
+#pdf(file = "figures/proximal_afterComBat_chromVAR_motifCorrelation.pdf", width = 10, height = 10)
+pheatmap(motif_cor, main = "Motif Correlation Clustered",  breaks = seq(-1, 1, length.out = 100))
+#dev.off()
+# feel free to manually save this motif correlation heatmap as a PDF!!
+```
+
+```{r}
+# make matrix of correlation between conditions (i.e. experiments + timepoints)
+sample_cor <- getSampleCorrelation(deviations)
+
+libs2 <-  c("Cyc-1", "Cyc-2", "d28-ctrl-1", "d28-ctrl-2", "d28-Miltenyi-1", "d28-Miltenyi-2", "DDIS-ctrl-1", "DDIS-ctrl-2", "DDIS-Miltenyi-2", "DDIS-Miltenyi-3", "d21-EasySep-1", "d21-EasySep-2", "d21-ctrl-1", "d21-ctrl-2")
+# plot heatmap of the samples' correlations with each other WITHOUT hierarchical clustering
+pheatmap(sample_cor, cluster_cols = FALSE, cluster_rows = FALSE, main = "Sample Correlation Unclustered", labels_row = libs2, labels_col=libs2)
+# feel free to manually save this unclustered sample correlation heatmap as a PDF!!
+```
+```{r}
+# plot heatmap of the samples' correlations with each other WITH hierarchical clustering
+annotation <- data.frame(TimePoints=gsub(" ", "", timepoints), Treatment=factor(treatment))
+tcolors <- c(Cycling="#000004FF", day28="#440154FF", DDIS="#472D7BFF", day21="#3B528BFF")
+ecolors <- c(None="#999999", Miltenyi="#E69F00", EasySep="#56B4E9")
+annotation_colors = list(TimePoints = tcolors, Treatment = ecolors)
+rownames(annotation) <- rownames(sample_cor)
+#pdf(file = "figures/proximal_afterComBat_chromVAR_sampleCorrelation.pdf", width = 10, height = 8)
+range <- max(abs(sample_cor));
+pheatmap(sample_cor, cluster_cols = TRUE, cluster_rows = TRUE, breaks = seq(-range, range, length.out = 100),
+         main = "Sample Correlation Clustered", annotation_row=annotation, annotation_colors = annotation_colors, labels_row = libs2, labels_col=libs2) 
+#dev.off()
+```
+```{r}
+# look at tsne plots to see grouping of motif deviations across all samples
+tsne_results = deviationsTsne(deviations, threshold=1.5, perplexity = 10, shiny = FALSE) #, what="samples")
+colnames(tsne_results) <- c("tsne_dim1", "tsne_dim2")
+tsne_results <- as.data.frame(tsne_results)
+tsne_results$Treatment <- factor(treatment)
+tsne_results$TimePoints <- factor(timepoints)
+# plot with legend looking at treatment
+plot(tsne_results$tsne_dim1, tsne_results$tsne_dim2, col=tsne_results$Treatment, main="TSNE on samples")
+legend(60,100,unique(tsne_results$Treatment),col=1:length(tsne_results$Treatment),pch=1) # will have to adjust legend position
+# plot with legend looking at timepoints
+plot(tsne_results$tsne_dim1, tsne_results$tsne_dim2, col=tsne_results$TimePoints, main="TSNE on samples")
+legend(50,30,unique(tsne_results$TimePoints),col=1:length(tsne_results$TimePoints),pch=1) # will have to adjust legend position
+# feel free to manually save this sample PCA plots as a PDF!!
+
+# look at "inverse" tsne plots to see grouping of samples across all the motifs
+inv_tsne_results <- deviationsTsne(deviations, threshold = 1.5, perplexity = 8, what = "annotations", shiny = FALSE)
+colnames(inv_tsne_results) <- c("tsne_dim1", "tsne_dim2")
+plot(inv_tsne_results, main="TSNE on motifs")
+# feel free to manually save this motif PCA plots as a PDF!!
+```
+
+################################################################################
+# 3. genomic annotations with chipseeker 
+################################################################################
+```{r}
+peak <- readPeakFile("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/LSA9_peaks_fixedWidth.bed")
+
+peakAnno <- annotatePeak("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/LSA9_peaks_fixedWidth.bed", tssRegion=c(-1000, 1000),TxDb=txdb, annoDb="org.Hs.eg.db")
+plotAnnoPie(peakAnno)
+
+distal_peaks <- data.frame(peakAnno)[data.frame(peakAnno)$annotation=='Distal Intergenic' | str_detect(data.frame(peakAnno)$annotation, "Intron"),]
+# save distal peaks
+write.table(distal_peaks, file = "PEAKS/distal_peaks.txt", quote = FALSE, row.names = FALSE, sep = "\t")
+
+proximal_peaks <- data.frame(peakAnno)[abs(data.frame(peakAnno)$distanceToTSS)< 1000,]
+# save distal peaks
+write.table(proximal_peaks, file = "PEAKS/proximal_peaks.txt", quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+################################################################################
+# 4. differential accessibility analysis on ATAC data with DESeq2
+################################################################################
+
+# replace rawCounts for combatRawCounts if ComBat_seq was used in the previous section!!
+
+```{r}
+mat = as.matrix(assays(fragmentCounts)[[1]]) 
+
+# construct the DESeq object necessary to then perform differential analysis on the data.
+dds = DESeqDataSetFromMatrix(countData = mat, design= ~TimePoints, # here is where you define the "design" of the analysis
+colData = colData(fragmentCounts), rowRanges= rowRanges(fragmentCounts))
+
+# only keep "master" peak rows that have at least 10 counts among all the samples
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+# now perfom the differential analysis on the DESeq object with the specified "design"
+dds <- DESeq(dds)
+```
+
+```{r}
+# so the reason why I'm getting a lot of NAs is because I'm using the wrong peak file. if I want to use proximal peak set instead to do DESeq, I need to go back to section 1 and re-make the count matrix by reading in the proximal peak file and then reading in the bams again to fulfil that. that's probably why my downstream analysis wasn't working. 
+
+```
+
+#################### read in the peak file (proximal) and reread in bam files to redo matrix counts. #####################
+```{r}
+proximal_peaks <- readPeakFile("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/PEAKS/proximal_peaks.txt")
+proximal_peaks <- proximal_peaks[, 3:16]
+bamFiles= c()
+for (i in 1:length(libs)) {
+  bamPath= dir(paste0(rawrundir, "pipe/", libs[i]), pattern=".bam", full.names=T)
+  bamFiles = c(bamFiles, bamPath)
+}
+
+# make matrix of fragment counts, where each peak in the "master" peak list makes
+# up the rows and each sample makes up the columns. Thus, the cells are the counts
+# of each peak in each sample's BAM file and stored as a RangedSummarizedExperiment
+proximal_fragmentCounts = getCounts(bamFiles, proximal_peaks, paired=TRUE, by_rg=FALSE, format="bam")
+
+# we then compute the GC bias of the fragment counts to better determine background peaks 
+proximal_fragmentCounts = addGCBias(proximal_fragmentCounts, genome = BSgenome.Hsapiens.UCSC.hg19)
+
+# add the library names to the columns of the RangedSummarizedExperiment object
+colnames(proximal_fragmentCounts) <- libs
+# add the experiment batches to the RangedSummarizedExperiment object
+treatment <- c("None", "None", "None", "None", "Miltenyi", "Miltenyi","None", "None",  "Miltenyi", "Miltenyi", "EasySep", "EasySep", "None", "None")
+colData(proximal_fragmentCounts)$Treatment = treatment
+# add the senescent timepoints to the RangedSummarizedExperiment object
+timepoints <- c("Cycling", "Cycling", "day 28", "day 28", "day 28", "day 28","DDIS", "DDIS",  "DDIS", "DDIS", "day 21", "day 21", "day 21", "day 21")
+colData(proximal_fragmentCounts)$TimePoints = timepoints
+
+# check before moving to next step! 
+```
+
+# filter the fragment counts to get rid of "master" peak rows with poor coverage across the samples.
+```{r}
+#proximal_fragmentCounts_filt <- filterSamples(proximal_fragmentCounts, min_depth=1500, min_in_peaks=0.15, shiny =FALSE)
+#proximal_fragmentCounts_filt <- sort(proximal_fragmentCounts_filt)
+```
+```{r}
+proximal_peaks <- sort(proximal_peaks)
+```
+
+## Note: this part of the code isn't working. 
+#proximal_counts_filtered <- filterPeaks(proximal_fragmentCounts, non_overlapping = TRUE, ix_return = TRUE)
+#proximal_fragmentCounts <- proximal_fragmentCounts[proximal_counts_filtered,]
+#proximal_peaks <- proximal_peaks[proximal_counts_filtered,]
+
+```{r}
+# get just the raw count matrix from the RangedSummarizedExperiment object 
+proximal_rawCounts = assays(proximal_fragmentCounts)[[1]]
+colnames(proximal_rawCounts) <- libs
+proximal_mat = as.matrix(assays(proximal_fragmentCounts)[[1]]) 
+
+# construct the DESeq object necessary to then perform differential analysis on the data.
+proximal_dds = DESeqDataSetFromMatrix(countData = proximal_mat, design= ~TimePoints, # here is where you define the "design" of the analysis
+colData = colData(proximal_fragmentCounts), rowRanges= rowRanges(proximal_fragmentCounts))
+
+# only keep "master" peak rows that have at least 10 counts among all the samples
+proximal_keep <- rowSums(counts(proximal_dds)) >= 10
+proximal_dds <- proximal_dds[proximal_keep,]
+
+# now perfom the differential analysis on the DESeq object with the specified "design"
+proximal_dds <- DESeq(proximal_dds)
+
+proximal_peakList <- proximal_peaks
+```
+```{r}
+for (i in c('day 28', 'day 21', 'DDIS')) {
+
+  res <- results(proximal_dds, c("TimePoints", "Cycling", i), name=paste0("TimePoints_", i, "_vs_Cycling"))
+  plotMA(res, main=paste0(i, 'vs_Cycling'))
+  res$symbol <- proximal_peakList$SYMBOL
+  index <- 1:length(proximal_peakList)
+  res$index <- index[proximal_keep]
+  resOrdered  <- res[order(res$pvalue),]
+  resSig  <- subset(resOrdered, padj < 0.1)
+  resSigUp  <- subset(resSig, log2FoldChange > 0)
+  resSigDown  <- subset(resSig, log2FoldChange < 0)
+  write.csv(resSigDown, file=paste0('saved_intermediates/DESeq_0P1pval/proximal_DEseq2_', i, 'vsCycling_down.csv'), quote = FALSE, row.names=FALSE)
+  write.csv(resSigUp, file=paste0('saved_intermediates/DESeq_0P1pval/proximal_DEseq2_', i, 'vsCycling_up.csv'), quote = FALSE, row.names=FALSE)
+  write.csv(resOrdered, file=paste0('saved_intermediates/DESeq/proximal_DEseq2_', i, 'vsCycling_full.csv'), quote = FALSE, row.names=FALSE)
+}
+```
+
+####### save BED files for DEseq dynamic results ####### 
+```{r}
+for (i in c('day 28', 'day 21', 'DDIS')) {
+  
+  dfpos = read.csv(paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/DESeq_0P1pval/proximal_DEseq2_", i, "vsCycling_up.csv"), header=TRUE)
+  dfneg = read.csv(paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/DESeq_0P1pval/proximal_DEseq2_", i, "vsCycling_down.csv"), header=TRUE)
+  write.table(proximal_peakList[dfpos$index,c(1,2,3,8)], file = paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/dynamic_peaks_wrt_Cycling/0p1/proximal_", i,"vsCycling_up.bed"), quote = FALSE, row.names = FALSE, col.names= FALSE, sep = "\t")
+  write.table(proximal_peakList[dfneg$index,c(1,2,3,8)], file = paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/dynamic_peaks_wrt_Cycling/0p1/proximal_", i,"vsCycling_down.bed"), quote = FALSE, row.names = FALSE, col.names= FALSE, sep = "\t")
+}
+```
+####### KEGG Pathway analysis for proximal peak set ####### 
+```{r}
+# I don't understand how this pathway analysis can be done if the results aren't saved outside of the loop. 
+genes <- list()
+otherTPs <- c('day 28', 'day 21', 'DDIS')
+for (i in otherTPs) {
+  res <- results(proximal_dds, c("TimePoints", "Cycling", i), name=paste0('TimePoints_', i, '_vs_Cycling'))
+  res$symbol <- proximal_peakList$SYMBOL[proximal_keep]
+  index <- 1:length(proximal_peakList)
+  res$index <- index[proximal_keep]
+  resOrdered  <- res[order(res$pvalue),]
+  resSig  <- subset(resOrdered, padj < 0.1)
+  resSigUp  <- subset(resSig, log2FoldChange > 0)
+  resSigDown  <- subset(resSig, log2FoldChange < 0)
+  genes[[paste0(i, 'vsCycling')]] <- proximal_peaks$geneId[resSigUp$index]
+  genes[[paste0(i, 'vsCycling')]] <- seq2gene(proximal_peaks[resSigUp$index], tssRegion = c(-1000, 1000), flankDistance = 3000, TxDb=TxDb.Hsapiens.UCSC.hg19.knownGene)
+}
+names(genes) = sub("_", "\n", names(genes))
+compKEGG <- compareCluster(geneCluster   = genes,
+                           fun           = "enrichKEGG",
+                           pvalueCutoff  = 0.05,
+                           pAdjustMethod = "BH")
+dotplot(compKEGG, showCategory = 30, title = "KEGG Pathway Enrichment Analysis")
+```
+
+################# read in the peak file (distal) and reread in bam files to redo matrix counts.  ##################
+```{r}
+distal_peaks <- readPeakFile("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/PEAKS/distal_peaks.txt")
+distal_peaks <- distal_peaks[, 3:16]
+bamFiles= c()
+for (i in 1:length(libs)) {
+  bamPath= dir(paste0(rawrundir, "pipe/", libs[i]), pattern=".bam", full.names=T)
+  bamFiles = c(bamFiles, bamPath)
+}
+
+# make matrix of fragment counts, where each peak in the "master" peak list makes
+# up the rows and each sample makes up the columns. Thus, the cells are the counts
+# of each peak in each sample's BAM file and stored as a RangedSummarizedExperiment
+distal_fragmentCounts = getCounts(bamFiles, distal_peaks, paired=TRUE, by_rg=FALSE, format="bam")
+
+# we then compute the GC bias of the fragment counts to better determine background peaks 
+distal_fragmentCounts = addGCBias(distal_fragmentCounts, genome = BSgenome.Hsapiens.UCSC.hg19)
+
+# add the library names to the columns of the RangedSummarizedExperiment object
+colnames(distal_fragmentCounts) <- libs
+# add the experiment batches to the RangedSummarizedExperiment object
+treatment <- c("None", "None", "None", "None", "Miltenyi", "Miltenyi","None", "None",  "Miltenyi", "Miltenyi", "EasySep", "EasySep", "None", "None")
+colData(distal_fragmentCounts)$Treatment = treatment
+# add the senescent timepoints to the RangedSummarizedExperiment object
+timepoints <- c("Cycling", "Cycling", "day 28", "day 28", "day 28", "day 28","DDIS", "DDIS",  "DDIS", "DDIS", "day 21", "day 21", "day 21", "day 21")
+colData(distal_fragmentCounts)$TimePoints = timepoints
+
+# check before moving to next step! 
+
+# filter the fragment counts to get rid of "master" peak rows with poor coverage across the samples.
+
+#distal_fragmentCounts_filt <- filterSamples(distal_fragmentCounts, min_depth=1500, min_in_peaks=0.15, shiny =FALSE)
+#distal_fragmentCounts_filt <- sort(distal_fragmentCounts_filt)
+
+distal_peaks <- sort(distal_peaks)
+
+# get just the raw count matrix from the RangedSummarizedExperiment object 
+distal_rawCounts = assays(distal_fragmentCounts)[[1]]
+colnames(distal_rawCounts) <- libs
+distal_mat = as.matrix(assays(distal_fragmentCounts)[[1]]) 
+
+# construct the DESeq object necessary to then perform differential analysis on the data.
+distal_dds = DESeqDataSetFromMatrix(countData = distal_mat, design= ~TimePoints, # here is where you define the "design" of the analysis
+colData = colData(distal_fragmentCounts), rowRanges= rowRanges(distal_fragmentCounts))
+
+# only keep "master" peak rows that have at least 10 counts among all the samples
+distal_keep <- rowSums(counts(distal_dds)) >= 10
+distal_dds <- distal_dds[distal_keep,]
+
+# now perform the differential analysis on the DESeq object with the specified "design"
+distal_dds <- DESeq(distal_dds)
+
+distal_peakList <- distal_peaks
+```
+
+```{r}
+for (i in c('day 28', 'day 21', 'DDIS')) {
+
+  res <- results(distal_dds, c("TimePoints", "Cycling", i), name=paste0("TimePoints_", i, "_vs_Cycling"))
+  plotMA(res, main=paste0(i, 'vs_Cycling'))
+  res$symbol <- distal_peakList$SYMBOL
+  index <- 1:length(distal_peakList)
+  res$index <- index[distal_keep]
+  resOrdered  <- res[order(res$pvalue),]
+  resSig  <- subset(resOrdered, padj < 0.1)
+  resSigUp  <- subset(resSig, log2FoldChange > 0)
+  resSigDown  <- subset(resSig, log2FoldChange < 0)
+  write.csv(resSigDown, file=paste0('saved_intermediates/DESeq_0P1pval/distal_DEseq2_', i, 'vsCycling_down.csv'), quote = FALSE, row.names=FALSE)
+  write.csv(resSigUp, file=paste0('saved_intermediates/DESeq_0P1pval/distal_DEseq2_', i, 'vsCycling_up.csv'), quote = FALSE, row.names=FALSE)
+  write.csv(resOrdered, file=paste0('saved_intermediates/DESeq/distal_DEseq2_', i, 'vsCycling_full.csv'), quote = FALSE, row.names=FALSE)
+}
+
+####### save BED files for DEseq dynamic results ####### 
+
+for (i in c('day 28', 'day 21', 'DDIS')) {
+  
+  dfpos = read.csv(paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/DESeq_0P1pval/distal_DEseq2_", i, "vsCycling_up.csv"), header=TRUE)
+  dfneg = read.csv(paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/DESeq_0P1pval/distal_DEseq2_", i, "vsCycling_down.csv"), header=TRUE)
+  write.table(distal_peakList[dfpos$index,c(1,2,3,8)], file = paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/dynamic_peaks_wrt_Cycling/0p1/distal_", i,"vsCycling_up.bed"), quote = FALSE, row.names = FALSE, col.names= FALSE, sep = "\t")
+  write.table(distal_peakList[dfneg$index,c(1,2,3,8)], file = paste0("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/dynamic_peaks_wrt_Cycling/0p1/distal_", i,"vsCycling_down.bed"), quote = FALSE, row.names = FALSE, col.names= FALSE, sep = "\t")
+}
+```
+####### KEGG Pathway analysis for distal peak set ####### 
+```{r}
+# I don't understand how this pathway analysis can be done if the results aren't saved outside of the loop. 
+genes <- list()
+otherTPs <- c('day 28', 'day 21', 'DDIS')
+for (i in otherTPs) {
+  res <- results(distal_dds, c("TimePoints", "Cycling", i), name=paste0('TimePoints_', i, '_vs_Cycling'))
+  res$symbol <- distal_peakList$SYMBOL[distal_keep]
+  index <- 1:length(distal_peakList)
+  res$index <- index[distal_keep]
+  resOrdered  <- res[order(res$pvalue),]
+  resSig  <- subset(resOrdered, padj < 0.1)
+  resSigUp  <- subset(resSig, log2FoldChange > 0)
+  resSigDown  <- subset(resSig, log2FoldChange < 0)
+  genes[[paste0(i, 'vsCycling')]] <- distal_peaks$geneId[resSigUp$index]
+  genes[[paste0(i, 'vsCycling')]] <- seq2gene(distal_peaks[resSigUp$index], tssRegion = c(-1000, 1000), flankDistance = 3000, TxDb=TxDb.Hsapiens.UCSC.hg19.knownGene)
+}
+names(genes) = sub("_", "\n", names(genes))
+compKEGG <- compareCluster(geneCluster   = genes,
+                           fun           = "enrichKEGG",
+                           pvalueCutoff  = 0.05,
+                           pAdjustMethod = "BH")
+dotplot(compKEGG, showCategory = 30, title = "KEGG Pathway Enrichment Analysis")
+```
+
+####### GSEA with clusterProfiler ####### 
+```{r}
+all_gene_sets = msigdbr(species = "Homo sapiens")
+
+# reading in data from deseq2
+## why only read day28 vs Q file and what's the reason for reading in distal regions? 
+
+dfpos = read.csv("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/DESeq_0P1pval/distal_DEseq2_day 28vsCycling_up.csv", header=TRUE)
+dfneg = read.csv("/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/DESeq_0P1pval/distal_DEseq2_day 28vsCycling_down.csv", header=TRUE)
+
+df <- rbind(dfpos, dfneg)
+
+# we want the log2 fold change 
+original_gene_list <- df$log2FoldChange
+
+# name the vector
+names(original_gene_list) <- proximal_peaks$SYMBOL[df$index]
+
+# omit any NA values
+## changed this from Nicole's script to exclude names that were NA, not values that were NA because NA means that its not a gene region. 
+gene_list<-original_gene_list[na.omit(names(original_gene_list))]
+
+# sort the list in decreasing order (required for clusterProfiler)
+gene_list = sort(gene_list, decreasing = TRUE)
+```
+```{r}
+gse <- gseGO(geneList=gene_list, 
+             ont ="ALL", 
+             keyType = "SYMBOL",
+             nPerm = 10000, 
+             minGSSize = 3, 
+             maxGSSize = 1000, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = org.Hs.eg.db, 
+             pAdjustMethod = "none")
+
+dotplot(gse, split=".sign") + facet_grid(.~.sign)
+```
+################################################################################
+# 5. motif enrichment with motifmatchr and hypergeometric tests
+################################################################################
+
+# getbakgroundpeaks chromVAR, remove dups, see what's left, filter for what has highes p value
+# hypergeometric test match_motif : phyper(overlap_fg_bg-1, bg, total-bg, fg, lower.tail= FALSE)
+# ^ https://seqqc.wordpress.com/2019/07/25/how-to-use-phyper-in-r/#:~:text=Hypergeometric%20tests%20are%20useful%20for,problem%20when%20sampling%20without%20replacement.&text=It%20is%20called%20the%20hypergeometric%20distribution.
+```{r}
+niter <- 500
+motifMax <- 386
+nPeaks <- nrow(fragmentCounts)
+otherTPs <- c('day 28', 'day 21', 'DDIS')
+motifEnrichment_up <- data.frame(matrix(NA,nrow = motifMax, ncol = length(otherTPs)))
+colnames(motifEnrichment_up) <- otherTPs
+motifEnrichment_down <- data.frame(matrix(NA,nrow = motifMax, ncol = length(otherTPs)))
+colnames(motifEnrichment_down) <- otherTPs
+sampled_bg <- getBackgroundPeaks(fragmentCounts, niterations = niter)
+for (i in 1:length(otherTPs)) {
+  res <- read.csv(paste0('/rugpfs/fs0/risc_lab/scratch/jyeung/LSA9/ATACseq_pipeline/Analysis/saved_intermediates/DESeq/proximal_DEseq2_', otherTPs[i], 'vsCycling_full.csv')) # CHANGE DISTAL/PROXIMAL
+  # get stable peaks
+  stable_inds <- 1:nrow(res); stable_inds <- stable_inds[res$pvalue > 0.5]
+  ####### 1. peaks that are INCREASING in accessibility ####### 
+  fg <- res[res$pvalue<0.1 & res$log2FoldChange>0,]
+  # get background peaks
+  bg <- c()
+  for (j in 1:niter) {
+  #  # make sure that the background peaks are stable AND has matched GC content
+   bg <- c(bg, intersect(sampled_bg[fg$index,j], stable_inds))
+  }
+  ## remove duplicates
+  bg <- unique(bg)
+  bg <- stable_inds
+  
+  # removed this part of the code because it was causing the rest of the loop to break. Need to ask Nicole about it. 
+  if (length(bg) < nrow(fg)) {
+    print('background smaller than foreground. sample the original count matrix deeper.')
+    break
+  }
+
+  # create subset of peaks for backgound and foreground
+  bg <- fragmentCounts[!is.na(bg),]; nbg <- nrow(bg)
+  fg <- fragmentCounts[!is.na(fg$index),]; nfg <- nrow(fg)
+
+  # find motifs for foreground
+  motif_fg = matchMotifs(motifs, fg, genome=BSgenome.Hsapiens.UCSC.hg19, out = "scores")
+  motifCount_fg <- motifCounts(motif_fg); motifCount_fg <- colSums(motifCount_fg)
+  # find motifs for background
+  motif_bg = matchMotifs(motifs, bg, genome=BSgenome.Hsapiens.UCSC.hg19, out = "scores")
+  motifCount_bg <- motifCounts(motif_bg); motifCount_bg <- colSums(motifCount_bg)
+  # hypergeometric test on all motifs
+  motifEnrichment_up[,i] = phyper(rowMins(cbind(motifCount_fg, motifCount_bg))-1, nbg, nPeaks-nbg, nfg, lower.tail= FALSE)
+  print(paste0('determined increasing accesibility motif enrichment for ', otherTPs[i]))
+}
+```
+```{r}
+  ####### 2. peaks that are DECREASING in accessibility ####### 
+for (i in 1:length(otherTPs)) {
+  fg <- res[res$pvalue<0.1 & res$log2FoldChange<0,]
+  # get background peaks
+  bg <- c()
+  for (j in 1:niter) {
+  #  # make sure that the background peaks are stable AND has matched GC content
+   bg <- c(bg, intersect(sampled_bg[fg$index,j], stable_inds))
+  }
+  ## remove duplicates
+  bg <- unique(bg)
+  bg <- stable_inds
+  
+  # create subset of peaks for backgound and foreground
+  bg <- fragmentCounts[!is.na(bg),]; nbg <- nrow(bg)
+  fg <- fragmentCounts[!is.na(fg$index),]; nfg <- nrow(fg)
+  # find motifs for foreground
+  motif_fg = matchMotifs(motifs, fg, genome=BSgenome.Hsapiens.UCSC.hg19, out = "scores")
+  motifCount_fg <- motifCounts(motif_fg); motifCount_fg <- colSums(motifCount_fg)
+  # find motifs for background
+  motif_bg = matchMotifs(motifs, bg, genome=BSgenome.Hsapiens.UCSC.hg19, out = "scores")
+  motifCount_bg <- motifCounts(motif_bg); motifCount_bg <- colSums(motifCount_bg)
+  # hypergeometric test on all motifs
+  motifEnrichment_down[,i] = phyper(rowMins(cbind(motifCount_fg, motifCount_bg))-1, nbg, nPeaks-nbg, nfg, lower.tail= FALSE)
+  print(paste0('determined decreasing accesibility motif enrichment for ', otherTPs[i]))
+}
+#add rownames and save motif enrichment scores
+rownames(motifEnrichment_down) <- colnames(motif_fg)
+rownames(motifEnrichment_up) <- colnames(motif_fg)
+```
+
+write.table(motifEnrichment_up, file = 'motif_enrichment_wrt_quiescence/proximal_DESeq_noGCmatch_up.txt', quote = FALSE, row.names = TRUE, col.names= TRUE, sep = "\t")
+write.table(motifEnrichment_down, file = 'motif_enrichment_wrt_quiescence/proximal_DESeq_noGCmatch_down.txt', quote = FALSE, row.names = TRUE, col.names= TRUE, sep = "\t")
+
+# plot results 
+```{r}
+#pheatmap(sample_cor, cluster_cols = TRUE, cluster_rows = TRUE, breaks = seq(-range, range, length.out = 100),
+#         main = "Sample Correlation Clustered", annotation_row=annotation, annotation_colors = annotation_colors) 
+#rownames(motifEnrichment_down) <- sapply(strsplit(rownames(motifEnrichment_down), "_"), "[", 2)
+#rownames(motifEnrichment_up) <- sapply(strsplit(rownames(motifEnrichment_up), "_"), "[", 2)
+temp_down <- -log(motifEnrichment_down)
+temp_down[temp_down==Inf] = 5
+temp_up <- -log(motifEnrichment_up)
+temp_up[temp_up==Inf] = 5
+temp_up = -1*temp_up
+temp <- temp_up + temp_down
+temp <- temp[rowSums(temp)!=0,]
+pheatmap(temp, breaks = seq(-5,5, length.out=100), cluster_cols = FALSE,
+         color=, main='-log(p_up) + log(p_down) from hypergeometric test on motif enrichment')
+
+```
+################################################################################
+# random stuff
+################################################################################
+
+# proximal venn diagram
+venn.diagram(
+  x = list(paste0(-56:0), paste0(-40:(20505-40)), paste0(-56:(41088-57))), #paste0(-108:0),paste0(-24:(237332-25))
+  category.names = c("ATRX ChIP promoter peaks\n(senescence-specific)", "ATAC promoter peaks\n(full timecourse)", 'all hg19 promoters'),
+  filename = 'figures/proximal_venn_diagramm_ATRX.png',
+  output=TRUE,
+  imagetype="png" ,
+  height = 800 , 
+  width = 900 , 
+  resolution = 250,
+  compression = "lzw",
+  lwd = 2,
+  lty = 'blank',
+  fill = brewer.pal(3, "Pastel2"),
+  cex = .6,
+  fontface = "bold",
+  fontfamily = "sans",
+  cat.cex = 0.6,
+  cat.fontface = "bold",
+  #cat.default.pos = "outer",
+  cat.pos = c(-50, 0, 120),
+  cat.dist = c(-0.075, -0.055, -0.05),
+  cat.fontfamily = "sans",
+  rotation = 1
+)
+
+# distal venn diagram
+venn.diagram(
+  x = list(paste0(-108:0), paste0(-24:(237332-25)), c(paste0(-2:(18188-2)), paste0(237332:(237332+(64570-18188))))),
+  category.names = c("ATRX ChIP intergenic peaks\n(senescence-specific)", "ATAC distal/intronic peaks\n(full timecourse)", 'all hg19 enhancers'),
+  filename = 'figures/distal_venn_diagramm_ATRX.png',
+  output=TRUE,
+  imagetype="png" ,
+  height = 800 , 
+  width = 900 , 
+  resolution = 250,
+  compression = "lzw",
+  lwd = 2,
+  lty = 'blank',
+  fill = brewer.pal(3, "Pastel2"),
+  cex = .6,
+  fontface = "bold",
+  fontfamily = "sans",
+  cat.cex = 0.6,
+  cat.fontface = "bold",
+  #cat.default.pos = "outer",
+  cat.pos = c(-40, 150, 0),
+  cat.dist = c(-0.05, 0.06, -0.05),
+  cat.fontfamily = "sans",
+  rotation = 1
+)
+
+### reorder fragmentcounts ###
+#reorderFragments <- fragmentCounts
+#reorderFragments[,1:9] <- fragmentCounts[,fragmentCounts$Experiments=='LSA2']
+#reorderFragments[,10:18] <- fragmentCounts[,fragmentCounts$Experiments=='LSA3']
+#reorderFragments[,19:27] <- fragmentCounts[,fragmentCounts$Experiments=='LSA5']
+#fragmentCounts <- reorderFragments
+## add the library names to the columns of the RangedSummarizedExperiment object
+#colnames(fragmentCounts) <- libs
+## add the experiment batches to the RangedSummarizedExperiment object
+#experiments <- c(rep("LSA2",9), rep("LSA3",9), rep("LSA5", 9))
+#colData(fragmentCounts)$Experiments = experiments
+## add the senescent timepoints to the RangedSummarizedExperiment object
+#timepoints <- c('CYC', 'D00', 'D03', 'D06', 'D09', 'D12', 'D16', 'D21', 'D28',
+#                'CYC', 'D00', 'D03', 'D06', 'D09', 'D12', 'D14', 'D21', 'D28',
+#                'CYC', 'D00', 'D03', 'D06', 'D09', 'D12', 'D14', 'D21', 'D28')
+#colData(fragmentCounts)$TimePoints = timepoints
+## get just the raw count matrix from the RangedSummarizedExperiment object 
+#rawCounts = assays(fragmentCounts)[[1]]
+#colnames(rawCounts) <- libs
